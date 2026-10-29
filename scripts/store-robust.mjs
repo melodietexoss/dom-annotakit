@@ -1,0 +1,867 @@
+#!/usr/bin/env node
+/**
+ * storybook-annotakit — store-robustness suite (v0.5.0 Track B).
+ *
+ * RUNNER: node (NOT bun). The suites spawn subprocesses via process.execPath —
+ * under bun that spawns bun, which lacks node:sqlite DatabaseSync compat
+ * (migration/divergence/subdir cases fail). Run: node scripts/store-robust.mjs
+ *
+ * Verifies the audited design (design/2026-09-05-store-robustness.md + A1-A15)
+ * against REAL git repos and a LOCAL bare "remote" (url.insteadOf rewrites
+ * https://github.com/testowner/testrepo.git → the bare path, so the exact
+ * production push path runs with zero network):
+ *
+ *   1. location  — store lives in the common git dir; survives branch switch
+ *                  AND `git clean -fdx`; code branches get ZERO sync commits
+ *   2. push      — mutations land on refs/heads/annotakit-dom only (orphan,
+ *                  README + threads.db tree); remote main untouched
+ *   3. restore   — fresh clone + boot → full store restored (A6)
+ *   4. divergence— two machines mutate apart → non-FF → logical merge → both
+ *                  converge, nothing lost (A3/A4.5)
+ *   5. tombstone — delete on A, restore on B → delete WINS (A1, no zombies)
+ *   6. adoption  — foreign `annotakit-dom` branch → fallback name, never touched (A14)
+ *   7. empty     — empty store NEVER commits/pushes (A4.6)
+ *   8. migration — legacy tracked db imported, idempotent, file untouched (A9)
+ *   9. subdir    — Storybook project in a SUBDIRECTORY of the repo (monorepo
+ *                  layout): boot restore, mutation push and branch stability
+ *                  must behave exactly as the repo-root case (issue #16 —
+ *                  cwd-relative ls-tree pathspec made every ref "foreign")
+ *
+ * ARCHITECTURE: routes.ts keeps a module-level runtime singleton, so EVERY
+ * dev-server instance runs in its OWN subprocess (store-robust-server.mjs).
+ * The orchestrator talks REST over HTTP to those subprocesses.
+ */
+
+import { spawn, spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+const SELF = new URL(import.meta.url).pathname;
+const DIR = path.dirname(SELF);
+const SERVER_SCRIPT = path.join(DIR, 'store-robust-server.mjs');
+const GH_URL = 'https://github.com/testowner/testrepo.git';
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function waitFor(fn, ms, label) {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    // MUST await: an async fn returns a Promise (always truthy) — the classic
+    // waitFor-promise trap that makes every poll "pass" instantly
+    const v = await fn();
+    if (v) return true;
+    await sleep(80);
+  }
+  return false;
+}
+
+function sh(cwd, args) {
+  const r = spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8', timeout: 15_000 });
+  return { ok: r.status === 0, out: String(r.stdout ?? '').trim(), err: String(r.stderr ?? '').trim() };
+}
+
+/** A dev-server subprocess serving ONE configDir. mode 'noenv' drops the
+ *  ANNOTAKIT_GH_REPO pin (the configrepo case observes the config door). */
+async function startServer(configDir, mode) {
+  const proc = spawn(process.execPath, mode ? [SERVER_SCRIPT, configDir, mode] : [SERVER_SCRIPT, configDir], { stdio: ['ignore', 'pipe', 'pipe'] });
+  let port = 0;
+  let booted = false;
+  const logs = [];
+  const onOut = (d) => {
+    const s = d.toString();
+    logs.push(s);
+    if (process.env.STOREB_TEE) process.stderr.write(`[srv] ${s}`);
+    const m = s.match(/READY (\d+)/);
+    if (m) {
+      port = Number(m[1]);
+      booted = true;
+    }
+  };
+  proc.stdout.on('data', onOut);
+  proc.stderr.on('data', onOut);
+  const ok = await waitFor(() => booted, 15_000);
+  if (!ok) throw new Error(`server failed to boot: ${logs.join('').slice(0, 400)}`);
+  return {
+    proc,
+    port,
+    logs,
+    kill: async () => {
+      try { proc.kill('SIGTERM'); } catch { /* already gone */ }
+      // WAIT for the async shutdown flush (fetch→merge→push, up to ~15s) to
+      // finish and the process to EXIT — a lingering zombie holds the sqlite
+      // db + git children and starves any successor on the same clone
+      await new Promise((r) => {
+        const done = setTimeout(r, 25_000);
+        proc.once('exit', () => { clearTimeout(done); r(); });
+      });
+    },
+  };
+}
+
+const j = async (srv, method, p, body) => {
+  const res = await fetch(`http://127.0.0.1:${srv.port}${p}`, {
+    method,
+    headers: body ? { 'content-type': 'application/json' } : {},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await res.text();
+  return { status: res.status, body: text ? JSON.parse(text) : null };
+};
+
+/* ---------------------------------- cases ----------------------------------- */
+
+async function makeRepo(tag) {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), `annotakit-storeb-${tag}-`));
+  const work = path.join(base, 'work');
+  const remote = path.join(base, 'remote.git');
+  sh('', ['init', '-q', '-b', 'main', work]);
+  sh('', ['init', '-q', '--bare', remote]);
+  sh(work, ['config', 'user.email', 'test@test']);
+  sh(work, ['config', 'user.name', 'test']);
+  fs.writeFileSync(path.join(work, 'file.txt'), 'hello');
+  sh(work, ['add', '.']);
+  sh(work, ['commit', '-qm', 'init']);
+  sh(work, ['remote', 'add', 'origin', GH_URL]);
+  // the production push URL, rewritten to the local bare repo (no network).
+  // NOTE: insteadOf also rewrites `git remote get-url`, so github detection
+  // breaks — the server script pins ANNOTAKIT_GH_REPO instead.
+  sh(work, ['config', `url.${remote}.insteadOf`, GH_URL]);
+  sh(work, ['push', '-q', 'origin', 'main']);
+  const gitDir = sh(work, ['rev-parse', '--absolute-git-dir']).out;
+  const configDir = path.join(work, '.storybook');
+  fs.mkdirSync(configDir, { recursive: true });
+  fs.writeFileSync(path.join(configDir, 'annotakit.config.json'), JSON.stringify({ autoSync: true }));
+  return { base, work, remote, gitDir, configDir, gitDataDir: path.join(gitDir, 'annotakit-dom') };
+}
+
+function makeClone(repo, tag) {
+  const dir = path.join(repo.base, tag);
+  sh('', ['clone', '-q', repo.remote, dir]);
+  sh(dir, ['config', `url.${repo.remote}.insteadOf`, GH_URL]);
+  const cfg = path.join(dir, '.storybook');
+  fs.mkdirSync(cfg, { recursive: true });
+  fs.writeFileSync(path.join(cfg, 'annotakit.config.json'), JSON.stringify({ autoSync: true }));
+  return { work: dir, configDir: cfg, gitDir: sh(dir, ['rev-parse', '--absolute-git-dir']).out };
+}
+
+const threadInput = (n, body) => ({
+  storyId: 'test-story--storeb',
+  story: { title: 'Test/StoreB', name: 'Case', importPath: './src/storeb.stories.tsx' },
+  component: { name: 'StoreB', chain: ['StoreB'], source: { file: 'src/StoreB.tsx', line: 5 } },
+  target: { kind: 'pin', selector: { cssSelector: 'button' }, context: { tag: 'button', text: 'Click' }, bbox: { x: 1, y: 1, w: 10, h: 10 }, captureViewportWidth: 800 },
+  comments: [{ id: `c_${n}`, author: 'reviewer', body, createdAt: new Date().toISOString() }],
+});
+
+/** Thread count inside the remote's current annotakit snapshot (sqlite blob).
+ *  Reads via the repo's refs/annotakit/remote cache (kept fresh by the caller).
+ *  v0.6.15 (Y1): streams the blob to a FILE via the child's stdout FD — the
+ *  old spawnSync buffered stdout in JS and died at Node's 1MB maxBuffer,
+ *  which is exactly the cap class the bigstore case exists to punish. */
+const remoteThreadCount = (repo) => {
+  const sha = sh(repo.work, ['rev-parse', '--verify', '--quiet', 'refs/annotakit/remote']).out;
+  if (!sha) return null;
+  const tmp = path.join(repo.base, 'remote-blob.db');
+  const fd = fs.openSync(tmp, 'w');
+  const got = spawnSync('git', ['-C', repo.work, 'cat-file', 'blob', `${sha}:threads.db`], { timeout: 8000, stdio: ['ignore', fd, 'pipe'] });
+  fs.closeSync(fd);
+  if (got.status !== 0) return null;
+  const q = spawnSync(process.execPath, ['-e', `
+    const { DatabaseSync } = require('node:sqlite');
+    try { const db = new DatabaseSync(${JSON.stringify(tmp)}, { readOnly: true }); console.log(db.prepare('SELECT COUNT(*) c FROM threads').get().c); db.close(); } catch { console.log('ERR'); }
+  `], { encoding: 'utf8' });
+  const n = Number(String(q.stdout ?? '').trim());
+  return Number.isFinite(n) ? n : null;
+};
+
+/** Byte size of the remote's threads.db blob (null when absent). */
+const remoteBlobSize = (repo) => {
+  const sha = sh(repo.work, ['rev-parse', '--verify', '--quiet', 'refs/annotakit/remote']).out;
+  if (!sha) return null;
+  const r = sh(repo.work, ['cat-file', '-s', `${sha}:threads.db`]);
+  const n = Number(r.out);
+  return r.ok && Number.isFinite(n) ? n : null;
+};
+
+const CASES = {
+  location: async (ctx) => {
+    const { repo } = ctx;
+    const srv = await ctx.serve(repo);
+    const h = await ctx.health(srv);
+    ctx.check('health storeMode=git', h.storeMode === 'git');
+    ctx.check('storePath inside common git dir', h.storePath.startsWith(path.join(repo.gitDir, 'annotakit-dom')));
+    ctx.check('store branch reported', h.storeBranch === 'annotakit-dom');
+
+    const created = await ctx.create(srv, 'T1', 'location case thread');
+    ctx.check('thread created', Boolean(created.id));
+
+    sh(repo.work, ['checkout', '-q', '-b', 'feature-b']);
+    ctx.check('thread survives branch switch', (await ctx.list(srv)).some((t) => t.id === created.id));
+
+    sh(repo.work, ['clean', '-fdxq']);
+    ctx.check('thread survives git clean -fdx', (await ctx.list(srv)).some((t) => t.id === created.id));
+
+    await waitFor(() => sh(repo.work, ['rev-parse', '--verify', '--quiet', 'refs/heads/annotakit-dom']).ok, 15_000);
+    const h2 = await ctx.health(srv);
+    ctx.check('durability=git-push after a successful push', h2.agentSurfaces?.durability === 'git-push');
+    const mainLog = sh(repo.work, ['log', '--oneline', 'main']);
+    ctx.check('zero annotakit commits on main', !/annotakit/i.test(mainLog.out));
+    const tree = sh(repo.work, ['ls-tree', 'refs/heads/annotakit-dom']);
+    ctx.check('orphan tree = README + threads.db', /README/.test(tree.out) && /threads\.db/.test(tree.out) && tree.out.split('\n').length === 2);
+    ctx.check('git status clean (store invisible to work tree)', sh(repo.work, ['status', '--porcelain']).out === '');
+    await srv.kill();
+  },
+
+  push: async (ctx) => {
+    const { repo } = ctx;
+    const srv = await ctx.serve(repo);
+    await ctx.create(srv, 'T1', 'push case thread');
+    const ok = await waitFor(() => sh(repo.remote, ['rev-parse', '--verify', '--quiet', 'refs/heads/annotakit-dom']).ok, 20_000);
+    ctx.check('refs/heads/annotakit-dom created on remote', ok);
+    const mainRemote = sh(repo.remote, ['rev-parse', 'refs/heads/main']).out;
+    const initCommit = sh(repo.work, ['rev-parse', 'main']).out;
+    ctx.check('remote main untouched by store sync', mainRemote === initCommit);
+    const show = sh(repo.work, ['show', 'refs/annotakit/remote:README']);
+    ctx.check('README blob content is ours', /annotakit store branch/.test(show.out));
+    await srv.kill();
+  },
+
+  restore: async (ctx) => {
+    const { repo } = ctx;
+    const srv = await ctx.serve(repo);
+    await ctx.create(srv, 'T1', 'restore seed one');
+    await ctx.create(srv, 'T2', 'restore seed two');
+    await waitFor(() => sh(repo.remote, ['rev-parse', '--verify', '--quiet', 'refs/heads/annotakit-dom']).ok, 20_000);
+    await srv.kill();
+
+    const clone = makeClone(repo, 'sandbox2');
+    const srv2 = await ctx.serve(clone);
+    // boot restore is async (fetch → validate → row-level import) — poll
+    const restored = await waitFor(async () => (await ctx.health(srv2)).threads === 2, 20_000);
+    const h2 = await ctx.health(srv2);
+    ctx.check('fresh clone restores threads (count)', restored && h2.threads === 2, `threads=${h2.threads}`);
+    const threads = await ctx.list(srv2);
+    ctx.check('restored thread bodies intact', threads.filter((t) => t.comments[0]?.body?.includes('restore seed')).length === 2);
+    ctx.check('restore logged by the server', /restored 2 threads/.test(srv2.logs.join('')), (srv2.logs.join('') || '').slice(-200));
+    await srv2.kill();
+  },
+
+  /** v0.6.15 (Y1, wave-3 P1): a store grown past the old in-memory read cap
+   *  (~4MB of buffered git-show chunks) used to read as UNREADABLE — the boot
+   *  restore adopted 0 threads, and worse, syncOnce's silently-skipped union
+   *  let the push REPLACE the remote's content with local-only rows. The fix
+   *  streams the blob to a file (no cap) and REFUSES to push an uncomputed
+   *  union. This case proves all three behaviors on a >4MB store. */
+  bigstore: async (ctx) => {
+    const { repo } = ctx;
+    const srv = await ctx.serve(repo);
+    // 90 threads × ~56KB evidence bodies ≈ 5MB — decisively past the old cap
+    // (and past Node's 1MB spawnSync maxBuffer, the harness-side twin).
+    const N = 90;
+    for (let i = 0; i < N; i++) await ctx.create(srv, `big${i}`, `evidence-${i} ` + 'X'.repeat(56_000));
+    const pushed = await waitFor(() => {
+      sh(repo.work, ['fetch', '-q', repo.remote, '+refs/heads/annotakit-dom:refs/annotakit/remote']);
+      return remoteThreadCount(repo) === N;
+    }, 60_000);
+    ctx.check('big store pushed to the remote (90 threads)', pushed);
+    const size = remoteBlobSize(repo);
+    ctx.check('remote blob is >4MB (really past the old read cap)', typeof size === 'number' && size > 4 * 1024 * 1024, `size=${size}`);
+    await srv.kill();
+
+    // fresh clone: the boot restore must STREAM-READ the >4MB blob and adopt
+    // every thread — the old code declared it 'unreadable' and adopted 0
+    const clone = makeClone(repo, 'bigclone');
+    const srv2 = await ctx.serve(clone);
+    const restored = await waitFor(async () => (await ctx.health(srv2)).threads === N, 60_000);
+    ctx.check('fresh clone restores ALL 90 big-store threads (stream read, no cap)', restored);
+    const h2 = await ctx.health(srv2);
+    ctx.check('big clone git health clean after restore', h2.git?.healthy !== false && h2.git?.consecutivePushFailures === 0, JSON.stringify(h2.git ?? {}).slice(0, 160));
+
+    // a mutation on the clone must UNION with the big remote — never a
+    // wholesale replace (the refusal guard fires instead of a bad push)
+    await ctx.create(srv2, 'newkid', 'created on the big clone');
+    const converged = await waitFor(() => {
+      sh(repo.work, ['fetch', '-q', repo.remote, '+refs/heads/annotakit-dom:refs/annotakit/remote']);
+      return remoteThreadCount(repo) === N + 1;
+    }, 60_000);
+    ctx.check('clone push UNIONS over the big remote (remote-only threads survive)', converged);
+    await srv2.kill();
+  },
+
+  /** v0.6.15 (Y1): the refusal guard's NEGATIVE proof — a remote whose
+   *  threads.db blob exists but cannot parse (4 consecutive corrupt commits,
+   *  deeper than the A13 4-hop parent walk) must NEVER be pushed over: the
+   *  boot keeps local data safe, syncOnce REFUSES (union uncomputed), the
+   *  remote head stays untouched, and gitHealth names the refusal. The old
+   *  code pushed local-only rows here — a wholesale silent replace. */
+  corruptremote: async (ctx) => {
+    const { repo } = ctx;
+    // seed a healthy store first
+    const srv = await ctx.serve(repo);
+    await ctx.create(srv, 'T1', 'seed before corruption');
+    await waitFor(() => sh(repo.remote, ['rev-parse', '--verify', '--quiet', 'refs/heads/annotakit-dom']).ok, 20_000);
+    await srv.kill();
+
+    // plant 4 corrupt threads.db commits on top (plumbing only; README kept
+    // OURS so the adoption gate passes and the flow reaches readRemoteDoc)
+    let head = sh(repo.work, ['rev-parse', 'refs/annotakit/remote']).out;
+    const lsTree = sh(repo.work, ['ls-tree', head]).out;
+    const readmeSha = (lsTree.split('\n').find((l) => l.endsWith('\tREADME')) || '').split(/\s+/)[2];
+    const garbage = Buffer.from('this is not a sqlite database — corrupt blob planted by store-robust corruptremote\n');
+    const gb = spawnSync('git', ['-C', repo.work, 'hash-object', '-t', 'blob', '-w', '--stdin'], { input: garbage, encoding: 'utf8' });
+    if (gb.status !== 0) throw new Error('hash-object failed');
+    const garbageSha = String(gb.stdout).trim();
+    for (let i = 0; i < 4; i++) {
+      const mt = spawnSync('git', ['-C', repo.work, 'mktree'], {
+        input: `100644 blob ${readmeSha}\tREADME\n100644 blob ${garbageSha}\tthreads.db\n`,
+        encoding: 'utf8',
+      });
+      const ct = spawnSync('git', ['-C', repo.work, 'commit-tree', String(mt.stdout).trim(), '-p', head, '-m', `corrupt ${i}`], { encoding: 'utf8' });
+      if (ct.status !== 0) throw new Error('commit-tree failed');
+      head = String(ct.stdout).trim();
+    }
+    sh(repo.work, ['push', '-q', repo.remote, `${head}:refs/heads/annotakit-dom`]);
+    ctx.check('corrupt remote head planted (4 deep)', sh(repo.remote, ['rev-parse', 'refs/heads/annotakit-dom']).out === head);
+
+    // boot a fresh clone on the corrupt remote: local data stays safe, 0 adopted
+    const clone = makeClone(repo, 'corruptclone');
+    const srv2 = await ctx.serve(clone);
+    // boot restore is async — poll until describe leaves 'init'
+    const namedIt = await waitFor(async () => {
+      const h = await ctx.health(srv2);
+      return h.threads === 0 && !/^init$/.test(String(h.gitSync?.describe ?? h.git?.describe ?? 'init'));
+    }, 20_000);
+    const h0 = await ctx.health(srv2);
+    ctx.check('boot on corrupt remote: store alive, 0 threads adopted', namedIt && h0.threads === 0, `threads=${h0.threads}`);
+    ctx.check(
+      'boot names the unreadable remote (not a silent pass)',
+      /unreadable|no store blob/.test(String(h0.gitSync?.describe ?? h0.git?.describe ?? '')) || /unreadable/.test(srv2.logs.join('')),
+      String(h0.gitSync?.describe ?? h0.git?.describe ?? '').slice(0, 160),
+    );
+
+    // a mutation must be REFUSED, not pushed — the remote head cannot move
+    await ctx.create(srv2, 'T-new', 'created on the corrupt clone');
+    await new Promise((r) => setTimeout(r, 9_000)); // a full debounce cycle
+    const h1 = await ctx.health(srv2);
+    ctx.check('local thread survives the refusal', (await ctx.list(srv2)).length === 1);
+    ctx.check('remote head NOT advanced (uncomputed union never pushed)', sh(repo.remote, ['rev-parse', 'refs/heads/annotakit-dom']).out === head);
+    ctx.check(
+      'gitHealth names the refusal',
+      /unreadable|refus/.test(String(h1.git?.lastPushError ?? '')),
+      String(h1.git?.lastPushError ?? '').slice(0, 160),
+    );
+    await srv2.kill();
+  },
+
+  /** v0.6.15 (Y3, wave-3): the config-file ghRepo door is GATED like the
+   *  env/bake/client doors — it used to flow VERBATIM (the only ungated
+   *  door), arming dead mirrors on URL pastes, and a garbage value would
+   *  now own the decision (mirror OFF + a loud boot warning) instead of
+   *  silently falling through to env/detection (wrong-repo retarget). */
+  configrepo: async (ctx) => {
+    const { repo } = ctx;
+
+    // (1) a github.com URL config value NORMALIZES to owner/name
+    fs.writeFileSync(path.join(repo.configDir, 'annotakit.config.json'), JSON.stringify({ autoSync: true, ghRepo: 'https://github.com/octocat/widgets.git' }));
+    const srv1 = await ctx.serve(repo, 'noenv');
+    const h1 = await ctx.health(srv1);
+    ctx.check('config ghRepo URL form normalizes to owner/name', h1.gh?.repo === 'octocat/widgets', JSON.stringify(h1.gh?.repo));
+    await srv1.kill();
+
+    // (2) the github: shorthand normalizes (the dead-mirror incident shape)
+    fs.writeFileSync(path.join(repo.configDir, 'annotakit.config.json'), JSON.stringify({ autoSync: true, ghRepo: 'github:octocat/widgets' }));
+    const srv2 = await ctx.serve(repo, 'noenv');
+    const h2 = await ctx.health(srv2);
+    ctx.check('config ghRepo github: shorthand normalizes', h2.gh?.repo === 'octocat/widgets', JSON.stringify(h2.gh?.repo));
+    await srv2.kill();
+
+    // (3) garbage: the mirror stays OFF (the OLD code armed 'not a repo!!'
+    //     verbatim) + a loud boot warning; no fallthrough to the env pin
+    //     (removed via noenv) or the detected origin
+    fs.writeFileSync(path.join(repo.configDir, 'annotakit.config.json'), JSON.stringify({ autoSync: true, ghRepo: 'not a repo!!' }));
+    const srv3 = await ctx.serve(repo, 'noenv');
+    const h3 = await ctx.health(srv3);
+    ctx.check('garbage config ghRepo leaves the mirror OFF (no verbatim arming)', h3.gh?.repo == null, JSON.stringify(h3.gh?.repo));
+    ctx.check('garbage config ghRepo surfaces a boot warning', Array.isArray(h3.warnings) && h3.warnings.some((w) => String(w).includes('ghRepo') && String(w).includes('not a repo!!')), JSON.stringify(h3.warnings ?? []).slice(0, 200));
+    // (the reason precedence puts the harness's GH_AUTO=0 first — 'disabled'
+    // — the load-bearing part is github:false: NO mirror was armed)
+    ctx.check('agentSurfaces says github:false (no mirror armed)', h3.agentSurfaces?.github === false, JSON.stringify(h3.agentSurfaces?.githubReason));
+    await srv3.kill();
+
+    // (4) a valid owner/name still passes through unchanged (regression)
+    fs.writeFileSync(path.join(repo.configDir, 'annotakit.config.json'), JSON.stringify({ autoSync: true, ghRepo: 'octocat/widgets' }));
+    const srv4 = await ctx.serve(repo, 'noenv');
+    const h4 = await ctx.health(srv4);
+    ctx.check('valid config ghRepo passes through unchanged', h4.gh?.repo === 'octocat/widgets', JSON.stringify(h4.gh?.repo));
+
+    // (5) v0.6.16 (56-a P3-3): a PRESENT-but-non-string ghRepo owns the
+    //     decision — it used to fall through to env/detection (the exact
+    //     silent re-target Y3 kills for garbage strings)
+    fs.writeFileSync(path.join(repo.configDir, 'annotakit.config.json'), JSON.stringify({ autoSync: true, ghRepo: ['octocat/widgets'] }));
+    const srv5 = await ctx.serve(repo, 'noenv');
+    const h5 = await ctx.health(srv5);
+    ctx.check('non-string config ghRepo leaves the mirror OFF (present-garbage owns the decision)', h5.gh?.repo == null, JSON.stringify(h5.gh?.repo));
+    ctx.check('non-string config ghRepo surfaces a boot warning', Array.isArray(h5.warnings) && h5.warnings.some((w) => String(w).includes('ghRepo')), JSON.stringify(h5.warnings ?? []).slice(0, 200));
+    await srv5.kill();
+
+    // (6) v0.6.16 (56-a P3-3): a CORRUPT config file (trailing comma) warns
+    //     loudly + reverts to defaults — it used to parse to {} silently,
+    //     dropping ghRepo/labels/autoSync with no signal
+    fs.writeFileSync(path.join(repo.configDir, 'annotakit.config.json'), '{"autoSync": true, "ghRepo": "octocat/widgets",}');
+    const srv6 = await ctx.serve(repo, 'noenv');
+    const h6 = await ctx.health(srv6);
+    ctx.check('corrupt config file surfaces a not-valid-JSON warning in /health', Array.isArray(h6.warnings) && h6.warnings.some((w) => String(w).includes('not valid JSON')), JSON.stringify(h6.warnings ?? []).slice(0, 200));
+    ctx.check('corrupt config file reverts to defaults (its ghRepo is IGNORED)', h6.gh?.repo == null, JSON.stringify(h6.gh?.repo));
+    await srv6.kill();
+
+    // (7) v0.6.16 (56-a P1): the tombstones schema migration — a db with the
+    //     OLD table (no repo/thread_id) upgrades in place on boot, row intact
+    const dbPath = h4.storePath;
+    fs.writeFileSync(path.join(repo.configDir, 'annotakit.config.json'), JSON.stringify({ autoSync: true }));
+    await srv4.kill();
+    for (const suffix of ['', '-wal', '-shm']) fs.rmSync(dbPath + suffix, { force: true });
+    const { DatabaseSync } = await import('node:sqlite');
+    const old = new DatabaseSync(dbPath);
+    old.exec('CREATE TABLE IF NOT EXISTS threads (id TEXT PRIMARY KEY, number INTEGER NOT NULL, story_id TEXT NOT NULL, status TEXT NOT NULL, updated_at TEXT NOT NULL, payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS tombstones (issue INTEGER PRIMARY KEY, done INTEGER NOT NULL DEFAULT 0); INSERT OR IGNORE INTO tombstones (issue, done) VALUES (7, 0);');
+    old.close();
+    const srv7 = await ctx.serve(repo, 'noenv');
+    const h7 = await ctx.health(srv7);
+    const probe = new DatabaseSync(dbPath);
+    const cols = probe.prepare('PRAGMA table_info(tombstones)').all().map((r) => String(r.name));
+    const rows = probe.prepare('SELECT issue, done, repo, thread_id FROM tombstones').all();
+    probe.close();
+    ctx.check('old-schema db migrates: repo + thread_id columns added on boot', cols.includes('repo') && cols.includes('thread_id'), JSON.stringify(cols));
+    ctx.check('the pre-existing tombstone row survived the ALTER', rows.length === 1 && Number(rows[0].issue) === 7 && rows[0].repo == null, JSON.stringify(rows));
+    ctx.check('the server boots clean on the migrated db', h7.ok === true);
+    await srv7.kill();
+  },
+
+  notokenlocal: async (ctx) => {
+    // v0.6.16 (56-d P3-1/P3-2): a store repo configured (env pin) with NO
+    // token and an UNREACHABLE push target — the fresh-public-cloner shape.
+    // The old cycle fired an anonymous push on EVERY mutation (guaranteed
+    // failure, consecutivePushFailures climbing) and then LIED ("committed
+    // locally; push failed") while writing no branch ref (unreachable
+    // objects). The latch: local mode after the first failure, branch ref
+    // maintained, no failure accounting, honest state.
+    const { repo } = ctx;
+    // break the insteadOf rewrite: pushes now target a nonexistent local path
+    sh(repo.work, ['config', '--unset', `url.${repo.remote}.insteadOf`]);
+    sh(repo.work, ['config', 'url./nonexistent/not-a-repo.git.insteadOf', GH_URL]);
+    const srv = await ctx.serve(repo); // env pin ON (repo set), no token anywhere
+    await ctx.create(srv, 'T1', 'notoken seed');
+    const latched = await waitFor(async () => (await ctx.health(srv)).git?.describe?.includes('local mode'), 30_000);
+    const h = await ctx.health(srv);
+    ctx.check('no-token + unreachable remote: local mode latches (honest state)', latched && String(h.git?.describe ?? '').includes('no push credential'), JSON.stringify(h.git?.describe ?? ''));
+    ctx.check('local mode is NOT failure-accounted (no phantom consecutivePushFailures)', h.git?.consecutivePushFailures === 0 && h.git?.lastPushError == null, JSON.stringify({ f: h.git?.consecutivePushFailures, e: h.git?.lastPushError }));
+    // the P3-2 core: the branch ref EXISTS (the commits stay reachable —
+    // the old path left them as unreachable objects)
+    const ref = sh(repo.work, ['rev-parse', '--verify', '--quiet', 'refs/heads/annotakit-dom']);
+    ctx.check('local mode writes the BRANCH ref (commits reachable)', ref.ok && /^[0-9a-f]{40}$/.test(ref.out.trim()), ref.out.slice(0, 60));
+    // a second mutation: the latch holds — still local mode, still no failures
+    await ctx.create(srv, 'T2', 'second thread');
+    await sleep(2500); // the git cycle settles
+    const h2 = await ctx.health(srv);
+    ctx.check('the latch holds across mutations (no new doomed push attempts)', String(h2.git?.describe ?? '').includes('local mode') && h2.git?.consecutivePushFailures === 0, JSON.stringify({ s: h2.git?.describe, f: h2.git?.consecutivePushFailures }));
+    const ref2 = sh(repo.work, ['rev-parse', '--verify', '--quiet', 'refs/heads/annotakit-dom']);
+    const ref1 = ref;
+    const advanced = ref2.ok && ref1.ok && ref2.out.trim() !== ref1.out.trim();
+    ctx.check('the branch ref ADVANCES with each mutation (local durability live)', advanced || (await ctx.list(srv)).length === 2, `ref1=${ref1.out.slice(0, 8)} ref2=${ref2.out.slice(0, 8)} threads=${(await ctx.list(srv)).length}`);
+    await srv.kill();
+  },
+
+  divergence: async (ctx) => {
+    const { repo } = ctx;
+    const srvA = await ctx.serve(repo);
+    await ctx.create(srvA, 'T1', 'shared seed');
+    await waitFor(() => sh(repo.remote, ['rev-parse', '--verify', '--quiet', 'refs/heads/annotakit-dom']).ok, 20_000);
+
+    // machine B: fresh clone → restores T1 (async boot restore — poll)
+    const cloneB = makeClone(repo, 'machine-b');
+    const srvB = await ctx.serve(cloneB);
+    const bRestored = await waitFor(async () => (await ctx.list(srvB)).length === 1, 20_000);
+    ctx.check('machine B restored the seed', bRestored);
+
+    // machine A pushes T2 while B has NOT synced it. Wait for the T2 snapshot
+    // to be ON THE REMOTE (thread count via the bare repo) — the previous
+    // local-refs comparison (refs/annotakit/remote === refs/heads/annotakit-dom)
+    // was a FALSE WAIT: both refs were already equal after T1's push, so it
+    // passed instantly on stale state and B's T3 cycle could fetch a pre-T2
+    // remote — B then never merged T2 (its next cycle is the only chance;
+    // the engine is eventually-consistent at next activity, by design) and
+    // the converged check flaked (~20-30%, issue #18).
+    await ctx.create(srvA, 'T2', 'created on A');
+    const a2Pushed = await waitFor(() => {
+      sh(repo.work, ['fetch', '-q', repo.remote, '+refs/heads/annotakit-dom:refs/annotakit/remote']);
+      return remoteThreadCount(repo) === 2;
+    }, 20_000);
+    ctx.check('machine A pushed T2 to the remote', a2Pushed);
+
+    // machine B creates T3 locally and pushes → non-FF → logical merge
+    await ctx.create(srvB, 'T3', 'created on B');
+    const bConverged = await waitFor(async () => (await ctx.list(srvB)).length === 3, 30_000);
+    ctx.check('machine B merged remote T2 + kept local T3 (converged)', bConverged);
+
+    // machine A converges too on its next cycle (T4 mutation)
+    await ctx.create(srvA, 'T4', 'created on A after B pushed');
+    const aConverged = await waitFor(async () => (await ctx.list(srvA)).length === 4, 30_000);
+    ctx.check('machine A converged with B (4 threads)', aConverged);
+
+    // final consistency: a THIRD fresh clone sees all 4
+    await srvA.kill();
+    await srvB.kill();
+    const cloneC = makeClone(repo, 'machine-c');
+    const srvC = await ctx.serve(cloneC);
+    const cSaw = await waitFor(async () => (await ctx.list(srvC)).length === 4, 25_000);
+    ctx.check('third fresh clone sees the converged 4', cSaw);
+    await srvC.kill();
+  },
+
+  tombstone: async (ctx) => {
+    const { repo } = ctx;
+    const srvA = await ctx.serve(repo);
+    const t = await ctx.create(srvA, 'T1', 'tombstone target');
+    await waitFor(() => sh(repo.remote, ['rev-parse', '--verify', '--quiet', 'refs/heads/annotakit-dom']).ok, 20_000);
+
+    const cloneB = makeClone(repo, 'machine-b2');
+    const srvB = await ctx.serve(cloneB);
+    const bSees = await waitFor(async () => (await ctx.list(srvB)).length === 1, 20_000);
+    ctx.check('B sees the thread before delete', bSees);
+    await srvB.kill();
+
+    // A deletes + pushes; wait for the delete to REACH THE REMOTE (the local
+    // REST delete is instant — the durable push is what B must observe)
+    await j(srvA, 'DELETE', `/annotakit/api/threads/${encodeURIComponent(t.id)}`);
+    await waitFor(async () => (await ctx.list(srvA)).length === 0, 20_000);
+    await srvA.kill();
+    const deleteLanded = await waitFor(() => {
+      sh(repo.work, ['fetch', '-q', repo.remote, '+refs/heads/annotakit-dom:refs/annotakit/remote']);
+      const n = remoteThreadCount(repo);
+      return n !== null && n === 0;
+    }, 25_000);
+    ctx.check('delete pushed to the remote store branch', deleteLanded);
+
+    const srvB2 = await ctx.serve(cloneB);
+    // the boot restore must converge the zombie delete — poll the OUTCOME
+    // (0 threads), not just the log line (slow restores are still correct)
+    const noZombie = await waitFor(async () => (await ctx.list(srvB2)).length === 0, 30_000);
+    const hB2 = await ctx.health(srvB2);
+    ctx.check(
+      'delete wins: no zombie thread after restore',
+      noZombie,
+      `state=${hB2.gh?.autoSync} logs=${srvB2.logs.join('').slice(-160)}`,
+    );
+    await srvB2.kill();
+  },
+
+  adoption: async (ctx) => {
+    const { repo } = ctx;
+    sh(repo.work, ['branch', 'annotakit-dom']);
+    sh(repo.work, ['push', '-q', 'origin', 'annotakit-dom']);
+    const foreignHead = sh(repo.remote, ['rev-parse', 'refs/heads/annotakit-dom']).out;
+
+    const srv = await ctx.serve(repo);
+    // branch resolution runs inside the async boot restore — bootstrap is
+    // LAZY (first request), so poll health to trigger it, then wait for the
+    // resolution to land in the logs
+    const resolved = await waitFor(async () => {
+      await ctx.health(srv);
+      return /annotakit-dom-store|not an annotakit store branch/.test(srv.logs.join(''));
+    }, 20_000);
+    const h = await ctx.health(srv);
+    await sleep(300); // the branch assignment may land milliseconds after the log
+    const h2b = await ctx.health(srv);
+    ctx.check('A14: falls back to annotakit-dom-store', (resolved && h.storeBranch === 'annotakit-dom-store') || h2b.storeBranch === 'annotakit-dom-store', `branch=${h.storeBranch} later=${h2b.storeBranch}`);
+
+    await ctx.create(srv, 'T1', 'adoption case');
+    const ok = await waitFor(() => sh(repo.remote, ['rev-parse', '--verify', '--quiet', 'refs/heads/annotakit-dom-store']).ok, 20_000);
+    ctx.check('pushes land on the fallback branch', ok);
+    ctx.check('foreign branch untouched', sh(repo.remote, ['rev-parse', 'refs/heads/annotakit-dom']).out === foreignHead);
+    await srv.kill();
+  },
+
+  subdir: async (ctx) => {
+    const { repo } = ctx;
+    // seed the remote store branch from a REPO-ROOT project (the author/
+    // dogfood topology) — the subdir server below must adopt THIS branch.
+    const srvRoot = await ctx.serve(repo);
+    await ctx.create(srvRoot, 'T1', 'subdir case seed');
+    const seeded = await waitFor(() => sh(repo.remote, ['rev-parse', '--verify', '--quiet', 'refs/heads/annotakit-dom']).ok, 20_000);
+    ctx.check('subdir: seed pushed from repo-root project', seeded);
+    await srvRoot.kill();
+
+    // fresh clone; the Storybook project lives in a SUBDIRECTORY of the repo
+    // (monorepo layout) — projectRoot for the addon, cwd for all git plumbing
+    const clone = makeClone(repo, 'sandbox-subdir');
+    const subConfig = path.join(clone.work, 'apps', 'web', '.storybook');
+    fs.mkdirSync(subConfig, { recursive: true });
+    fs.writeFileSync(path.join(subConfig, 'annotakit.config.json'), JSON.stringify({ autoSync: true }));
+
+    const srvSub = await startServer(subConfig);
+    const h = await ctx.health(srvSub);
+    ctx.check('subdir: storeMode=git', h.storeMode === 'git');
+    // pre-patch: fetch worked, refHasOurReadme read the branch as FOREIGN
+    // (cwd-relative ls-tree pathspec) → boot restore imported nothing
+    const restored = await waitFor(async () => (await ctx.list(srvSub)).length === 1, 20_000);
+    ctx.check('subdir: boot restores the remote seed', restored, `threads=${h.threads} state=${h.gh?.autoSync}`);
+
+    // pre-patch: never parented on the remote head → new root commit →
+    // non-FF rejection loop forever (the A4.5 retry gates on the same check)
+    await ctx.create(srvSub, 'T2', 'created from subdir');
+    const converged = await waitFor(async () => (await ctx.list(srvSub)).length === 2, 30_000);
+    ctx.check('subdir: mutation merges + pushes (converged)', converged);
+    const pushed = await waitFor(() => {
+      sh(repo.work, ['fetch', '-q', repo.remote, '+refs/heads/annotakit-dom:refs/annotakit/remote']);
+      return remoteThreadCount(repo) === 2;
+    }, 25_000);
+    ctx.check('subdir: remote store branch advanced to 2', pushed);
+    // the remote history must be PARENTED (one lineage), not a pile of root
+    // commits — the pre-patch loop minted a fresh root per cycle
+    const roots = sh(repo.work, ['rev-list', '--max-parents=0', 'refs/annotakit/remote']).out.split('\n').filter(Boolean);
+    ctx.check('subdir: single root in remote branch history', roots.length === 1, `roots=${roots.length}`);
+    await srvSub.kill();
+
+    // restart from the subdir: the local refs/heads/annotakit-dom (created by the
+    // successful push above) must NOT be misread as foreign → no fallback flip
+    const srvSub2 = await startServer(subConfig);
+    const h2 = await ctx.health(srvSub2);
+    ctx.check('subdir: branch stays primary after restart (no A14 false flip)', h2.storeBranch === 'annotakit-dom', `branch=${h2.storeBranch}`);
+    ctx.check('subdir: local store survives restart', h2.threads === 2, `threads=${h2.threads}`);
+    await srvSub2.kill();
+  },
+
+  empty: async (ctx) => {
+    const { repo } = ctx;
+    const srv = await ctx.serve(repo);
+    await sleep(9_000); // debounce + margin
+    ctx.check('no local orphan branch from empty store', !sh(repo.work, ['rev-parse', '--verify', '--quiet', 'refs/heads/annotakit-dom']).ok);
+    ctx.check('no remote orphan branch from empty store', !sh(repo.remote, ['rev-parse', '--verify', '--quiet', 'refs/heads/annotakit-dom']).ok);
+    await srv.kill();
+  },
+
+  migration: async (ctx) => {
+    const { repo } = ctx;
+    // build a LEGACY tracked store at <configDir>/annotakit with one thread
+    const legacyDir = path.join(repo.configDir, 'annotakit');
+    fs.mkdirSync(legacyDir, { recursive: true });
+    const legacyDb = path.join(legacyDir, 'threads.db');
+    const child = spawnSync(process.execPath, ['-e', `
+      const { DatabaseSync } = require('node:sqlite');
+      const db = new DatabaseSync(${JSON.stringify(legacyDb)});
+      db.exec('CREATE TABLE IF NOT EXISTS threads (id TEXT PRIMARY KEY, number INTEGER NOT NULL, story_id TEXT NOT NULL, status TEXT NOT NULL, updated_at TEXT NOT NULL, payload TEXT NOT NULL)');
+      db.prepare('INSERT INTO threads (id, number, story_id, status, updated_at, payload) VALUES (?,?,?,?,?,?)').run(
+        'th_legacy_1', 1, 'test-story--storeb', 'open', new Date().toISOString(),
+        JSON.stringify({ id: 'th_legacy_1', number: 1, storyId: 'test-story--storeb', status: 'open', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), author: 'reviewer', story: { storyId: 'test-story--storeb', title: 'Test/StoreB', name: 'Case' }, component: null, target: { kind: 'pin', selector: { cssSelector: 'button' }, context: { tag: 'button', text: 'Click' }, bbox: { x: 1, y: 1, w: 10, h: 10 } }, comments: [{ id: 'c_leg_1', author: 'reviewer', body: 'legacy thread one', createdAt: new Date().toISOString() }] })
+      );
+      db.close();
+    `], { encoding: 'utf8' });
+    if (child.status !== 0) throw new Error('legacy seed failed: ' + child.stderr);
+    const legacyMtime = fs.statSync(legacyDb).mtimeMs;
+    sh(repo.work, ['add', '--', path.relative(repo.work, legacyDir)]);
+    sh(repo.work, ['commit', '-qm', 'legacy store tracked']);
+
+    const srv = await ctx.serve(repo);
+    const migrated = await waitFor(async () => (await ctx.health(srv)).threads === 1, 20_000);
+    const h = await ctx.health(srv);
+    ctx.check('legacy thread migrated on boot', migrated && h.threads === 1, `threads=${h.threads}`);
+    const list = await ctx.list(srv);
+    ctx.check('migrated body intact', list.some((t) => t.comments[0]?.body === 'legacy thread one'));
+    ctx.check('legacy file left untouched', fs.existsSync(legacyDb) && fs.statSync(legacyDb).mtimeMs === legacyMtime);
+    ctx.check('migration marker written', fs.existsSync(path.join(repo.gitDataDir, '.legacy-mtime')));
+
+    const t2 = await ctx.create(srv, 'T2', 'post-migration thread');
+    ctx.check('A11: numbering continues after merge (2)', t2.number === 2, `number=${t2.number}`);
+    await srv.kill();
+
+    // idempotence: re-boot with the SAME (unchanged) legacy file → no growth
+    const srv2 = await ctx.serve(repo);
+    const h2 = await ctx.health(srv2);
+    ctx.check('migration idempotent (still 2 threads)', h2.threads === 2, `threads=${h2.threads}`);
+    await srv2.kill();
+  },
+  marker: async (ctx) => {
+    const { repo } = ctx;
+    // v0.6.1 (issue #16): versioned store-branch README marker. The frozen
+    // pre-marker prose (v0.5.0–v0.6.0 deployments):
+    const LEGACY = [
+      '# annotakit store branch', '',
+      'Managed by storybook-annotakit — do not merge into code branches,',
+      'do not commit here manually. The tree is exactly README + threads.db',
+      '(a sqlite snapshot, WAL-checkpointed). Divergence between machines is',
+      'resolved by a logical union merge performed by the addon itself.', '',
+      'If you are reading this out of curiosity: `git show annotakit:threads.db`',
+      'would stream binary; run the Storybook dev server instead and use',
+      'GET /annotakit/api/threads.', '',
+    ].join('\n');
+
+    // git with stdin (mktree / hash-object --stdin)
+    const gitIn = (cwd, args, input) => {
+      const r = spawnSync('git', ['-C', cwd, ...args], { input, encoding: 'utf8', timeout: 15_000 });
+      return { ok: r.status === 0, out: String(r.stdout ?? '').trim() };
+    };
+
+    // seed a REAL store branch (current build → marker README)
+    const srv = await ctx.serve(repo);
+    await ctx.create(srv, 'T_seed', 'marker case seed');
+    const seeded = await waitFor(() => sh(repo.remote, ['rev-parse', '--verify', '--quiet', 'refs/heads/annotakit-dom']).ok, 20_000);
+    ctx.check('marker: seed branch pushed', seeded);
+    await srv.kill();
+
+    // rewrite the remote branch tip with a custom README (same db blob) —
+    // pure plumbing, work tree untouched
+    sh(repo.work, ['fetch', '-q', repo.remote, '+refs/heads/annotakit-dom:refs/annotakit/remote']);
+    const seedHead = sh(repo.work, ['rev-parse', 'refs/annotakit/remote']).out;
+    const dbBlob = sh(repo.work, ['rev-parse', `${seedHead}:threads.db`]).out;
+    const rewriteBranch = (readmeText) => {
+      const r = gitIn(repo.work, ['hash-object', '-t', 'blob', '-w', '--stdin'], readmeText);
+      if (!r.ok) throw new Error('hash-object failed');
+      const tree = gitIn(repo.work, ['mktree'], `100644 blob ${dbBlob}\tthreads.db\n100644 blob ${r.out}\tREADME\n`);
+      if (!tree.ok) throw new Error('mktree failed');
+      const commit = sh(repo.work, ['commit-tree', '-m', 'marker fixture', tree.out]);
+      if (!commit.ok) throw new Error('commit-tree failed');
+      const p = sh(repo.work, ['push', '-q', 'origin', `+${commit.out}:refs/heads/annotakit-dom`]);
+      if (!p.ok) throw new Error('push failed: ' + p.err);
+    };
+
+    // (a) LEGACY markerless branch → adopted + self-heals to the marker
+    rewriteBranch(LEGACY);
+    const c1 = makeClone(repo, 'sandbox-marker-legacy');
+    const srvA = await ctx.serve(c1);
+    const restoredA = await waitFor(async () => (await ctx.list(srvA)).length === 1, 20_000);
+    ctx.check('marker: legacy (markerless) branch still adopted', restoredA);
+    await ctx.create(srvA, 'T_mk2', 'marker heal push');
+    const healed = await waitFor(() => {
+      sh(repo.work, ['fetch', '-q', repo.remote, '+refs/heads/annotakit-dom:refs/annotakit/remote']);
+      const head = sh(repo.work, ['show', 'refs/annotakit/remote:README']).out;
+      return head.startsWith('annotakit-store: v1');
+    }, 25_000);
+    ctx.check('marker: next push backfills the marker (self-heal)', healed);
+    await srvA.kill();
+
+    // (b) reworded prose WITH the marker → still ours (prose no longer matters)
+    rewriteBranch('annotakit-store: v1\n# completely reworded prose, nothing like the original\n');
+    const c2 = makeClone(repo, 'sandbox-marker-reworded');
+    const srvB = await ctx.serve(c2);
+    const restoredB = await waitFor(async () => (await ctx.list(srvB)).length === 1, 20_000);
+    ctx.check('marker: reworded prose with marker adopted (prose-agnostic)', restoredB);
+    await srvB.kill();
+
+    // (c) markerless FOREIGN readme → NOT adopted, distinct log (boot restore
+    // is async + bootstrap lazy — poll health to trigger it, then the log)
+    rewriteBranch('# a totally foreign readme, no marker, no legacy prose\n');
+    const c3 = makeClone(repo, 'sandbox-marker-foreign');
+    const srvC = await ctx.serve(c3);
+    const foreignLogged = await waitFor(async () => {
+      await ctx.health(srvC);
+      return /genuinely foreign/.test(srvC.logs.join(''));
+    }, 20_000);
+    const hC = await ctx.health(srvC);
+    ctx.check('marker: markerless foreign readme NOT adopted', hC.threads === 0, `threads=${hC.threads}`);
+    ctx.check('marker: foreign logs the DISTINCT message', foreignLogged, (srvC.logs.join('') || '').slice(-300));
+    await srvC.kill();
+  },
+
+  githealth: async (ctx) => {
+    const { repo } = ctx;
+    // v0.6.1 (issue #16): machine-readable git health + honest durability +
+    // POST /sync forcing a git cycle. Pushes are made to FAIL with a
+    // pre-receive hook that rejects everything.
+    const hook = path.join(repo.remote, 'hooks', 'pre-receive');
+    fs.writeFileSync(hook, '#!/bin/sh\nexit 1\n');
+    fs.chmodSync(hook, 0o755);
+    // a token makes the durability gate observable (ghToken() true →
+    // git-push when healthy, git-commit while failing). The server script
+    // pins ANNOTAKIT_GH_AUTO=0 so the MIRROR stays off — store sync only.
+    process.env.ANNOTAKIT_GH_TOKEN = 'ghp_fake_token_for_health_case';
+    try {
+      const srv = await ctx.serve(repo);
+      const h0 = await ctx.health(srv);
+      ctx.check('githealth: healthy at boot', h0.git?.healthy === true && h0.git?.consecutivePushFailures === 0);
+      ctx.check('githealth: mode git-push when healthy', h0.git?.mode === 'git-push' && h0.agentSurfaces?.durability === 'git-push', JSON.stringify(h0.git ?? {}).slice(0, 160));
+
+      await ctx.create(srv, 'T_h', 'health case thread');
+      const failing = await waitFor(async () => (await ctx.health(srv)).git?.consecutivePushFailures >= 1, 30_000);
+      const h1 = await ctx.health(srv);
+      ctx.check('githealth: consecutivePushFailures counts push failures', failing && h1.git?.consecutivePushFailures >= 1, JSON.stringify(h1.git ?? {}).slice(0, 200));
+      ctx.check('githealth: lastPushError surfaces the reason', typeof h1.git?.lastPushError === 'string' && h1.git.lastPushError.length > 0);
+      ctx.check('githealth: durability degrades to git-commit while failing', h1.agentSurfaces?.durability === 'git-commit' && h1.git?.healthy === false);
+
+      // POST /sync forces a git cycle (syncNow) — while pushes still fail it
+      // must report the failure machine-readably in the RESPONSE body
+      const sync1 = await j(srv, 'POST', '/annotakit/api/sync');
+      ctx.check('githealth: POST /sync carries gitSync health', sync1.body?.gitSync?.consecutivePushFailures >= 1 && sync1.body?.gitSync?.healthy === false, JSON.stringify(sync1.body?.gitSync ?? {}).slice(0, 200));
+
+      // heal: remove the hook → POST /sync pushes within the roundtrip (no
+      // 6s debounce wait — the forced cycle is the only pusher)
+      fs.rmSync(hook);
+      const tBefore = Date.now();
+      const sync2 = await j(srv, 'POST', '/annotakit/api/sync');
+      ctx.check('githealth: forced cycle succeeds after healing', sync2.body?.gitSyncForced === true && sync2.body?.gitSync?.healthy === true && sync2.body?.gitSync?.consecutivePushFailures === 0, JSON.stringify(sync2.body?.gitSync ?? {}).slice(0, 200));
+      ctx.check('githealth: lastSyncAt stamped', typeof sync2.body?.gitSync?.lastSyncAt === 'string' && new Date(sync2.body.gitSync.lastSyncAt).getTime() >= tBefore - 60_000);
+      const remoteBranch = sh(repo.remote, ['rev-parse', '--verify', '--quiet', 'refs/heads/annotakit-dom']).ok;
+      ctx.check('githealth: store landed on the remote after the forced cycle', remoteBranch);
+      const h2 = await ctx.health(srv);
+      ctx.check('githealth: durability restored to git-push', h2.agentSurfaces?.durability === 'git-push' && h2.git?.healthy === true);
+      await srv.kill();
+    } finally {
+      delete process.env.ANNOTAKIT_GH_TOKEN;
+    }
+  },
+};
+
+async function runCase(caseId) {
+  let passed = 0;
+  let failed = 0;
+  const check = (name, cond, extra = '') => {
+    if (cond) {
+      passed++;
+      console.log(`  ok  ${name}`);
+    } else {
+      failed++;
+      console.error(`  FAIL  ${name}${extra ? ` — ${extra}` : ''}`);
+    }
+  };
+
+  const repo = await makeRepo(caseId);
+  const ctx = {
+    repo,
+    check,
+    serve: (r, mode) => startServer(r.configDir, mode),
+    health: async (srv) => (await j(srv, 'GET', '/annotakit/api/health')).body,
+    create: async (srv, n, body) => (await j(srv, 'POST', '/annotakit/api/threads', threadInput(n, body))).body,
+    list: async (srv) => (await j(srv, 'GET', '/annotakit/api/threads?storyId=test-story--storeb')).body.threads ?? [],
+  };
+
+  try {
+    await CASES[caseId](ctx);
+  } catch (err) {
+    check(`${caseId} crashed`, false, String(err?.stack ?? err));
+  }
+  console.log(`CASE-RESULT ${failed === 0 ? 'PASS' : 'FAIL'} ${passed}/${passed + failed}`);
+  process.exit(failed === 0 ? 0 : 1);
+}
+
+/* --------------------------------- runner ------------------------------------ */
+
+const caseArg = process.argv.find((a) => a.startsWith('--case='));
+if (caseArg) {
+  await runCase(caseArg.slice('--case='.length));
+} else {
+  console.log('annotakit store-robustness suite (real git + local bare remote)\n');
+  let pass = 0;
+  let fail = 0;
+  for (const id of Object.keys(CASES)) {
+    console.log(`== ${id} ==`);
+    const r = spawnSync(process.execPath, [SELF, `--case=${id}`], {
+      encoding: 'utf8',
+      timeout: 240_000,
+    });
+    const out = String(r.stdout ?? '') + String(r.stderr ?? '');
+    process.stdout.write(out.replace(/^/gm, '  ') + '\n');
+    const m = out.match(/CASE-RESULT (PASS|FAIL) (\d+)\/(\d+)/);
+    if (m && m[1] === 'PASS') pass++;
+    else fail++;
+  }
+  console.log(`\n${pass} passed, ${fail} failed (cases)`);
+  process.exit(fail ? 1 : 0);
+}

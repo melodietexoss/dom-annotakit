@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>dom-annotakit — capture review</title>
+    <style>
+      /* Design D2a scrolling contract (load-bearing): the HOST PAGE NEVER
+         SCROLLS — the capture scrolls INSIDE the iframe; pins are
+         position:fixed against the iframe's viewport. */
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        overflow: hidden;
+      }
+      #root {
+        height: 100%;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/host/main.tsx"></script>
+  </body>
+</html>

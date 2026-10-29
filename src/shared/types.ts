@@ -1,0 +1,497 @@
+/**
+ * storybook-annotakit — shared domain types.
+ *
+ * Lean by design (user feedback: previous JSON export was "extremely verbose").
+ * A thread = one pin/region + its comment thread + everything an implementer
+ * agent needs to find the code: story metadata (index.json) and React component
+ * metadata (fiber walk at capture time). DOM selectors are the fallback anchor,
+ * not the identity.
+ */
+
+/** v0.6.3 review-flow triage (design/2026-09-13) + v0.6.11 (S7-A) durable
+ *  rejected: 'fixed' = addressed by the agent, awaiting reviewer verification
+ *  — the agent's Path B terminal state. 'rejected' = the reviewer did NOT
+ *  accept the fix — re-work expected; the verdict is DURABLE (survives
+ *  reloads/recalls; the old fixed→open reject erased it). 'resolved' =
+ *  reviewer-confirmed.
+ *  Workflow: open → fixed (agent) → resolved (reviewer confirms; the ONLY
+ *  path to resolved for agent-touched threads) | rejected (reviewer rejects);
+ *  rejected → fixed (agent re-addresses — re-enters review) | resolved
+ *  (reviewer confirms after all) | open (reviewer clears the verdict);
+ *  direct open → resolved stays legal (trivial fixes / reviewer's own
+ *  threads); resolved → open = reopen. Guards: →rejected only FROM fixed;
+ *  resolved→fixed and resolved→rejected are 400s (reopen first).
+ *  On the GitHub mirror: resolved → closed; open|fixed|rejected → open (a
+ *  rejection posts a system notice comment — the agent-visible re-work
+ *  signal). */
+export type ThreadStatus = 'open' | 'fixed' | 'rejected' | 'resolved';
+export type ThreadKind = 'pin' | 'region';
+
+/** v0.6.3: the GitHub-mirror state a thread status maps to (resolved → closed;
+ *  open|fixed|rejected → open — a thread awaiting reviewer verification OR
+ *  rejected-and-awaiting-rework is OPEN on GitHub; closing = reviewer-
+ *  confirmed). ONE source shared by both engines (server ghsync + browser
+ *  ghClient): push `want`, pull drift detection and the stalled sweep must
+ *  all agree. */
+export const mirrorStateOf = (status: ThreadStatus): 'open' | 'closed' => (status === 'resolved' ? 'closed' : 'open');
+
+/** Hard cap on ONE comment body, enforced at every capture door (server
+ *  routes 413, client composer submit-guard, static store) — sized under
+ *  GitHub's own 65,536-char comment limit so a mirrored body is always
+ *  acceptable. The FULL body still lives in the store and the json export;
+ *  only md digests clip for display. */
+export const MAX_BODY_CHARS = 64_000;
+
+/** Display clip for digest headline + reply lines (md only). */
+export const DIGEST_CLIP_CHARS = 200;
+
+/** Honest ceiling for a mirrored GitHub ISSUE body (issue #16). GitHub itself
+ *  caps issue bodies at 65,536 chars; a thread with several 64k comments can
+ *  exceed that, so the mirror clips at this budget WITH a pointer to the full
+ *  thread (API / panel export). Normal notes NEVER hit it — bodies are
+ *  mirrored VERBATIM (digest lean-clip is display-only, never on the mirror). */
+export const ISSUE_BODY_LIMIT = 60_000;
+
+/** v0.6.4 mirror self-heal (issue #16): every full-text mirror body marks
+ *  each comment block with this string. A mapped issue body WITHOUT it was
+ *  written by a pre-v0.6.3 engine (comment bodies clipped at 200 chars,
+ *  titles at 60) and is a heal candidate — the engines re-push the verbatim
+ *  body on pull until it sticks. Single constant so the server engine, the
+ *  static client engine and scripts/heal-mirrors.mjs can never disagree. */
+export const MIRROR_VERBATIM_MARKER = '(verbatim):**';
+
+/** Story metadata captured at pin time (from /index.json + CSF render context). */
+export interface StoryRef {
+  storyId: string;
+  /** Sidebar group title, e.g. "Nimbus Components". */
+  title?: string;
+  /** Story name, e.g. "Danger". */
+  name?: string;
+  /** CSF file that declares the story (relative to project root). */
+  importPath?: string;
+  /** File providing meta.component when the indexer detected it. */
+  componentPath?: string;
+  /** Deep link to open this story in the manager. */
+  url?: string;
+}
+
+/** JSX creation site of the nearest component (parsed from fiber _debugStack). */
+export interface ComponentSource {
+  file: string;
+  line?: number;
+  column?: number;
+}
+
+/**
+ * React component identity for the pinned element — the differentiator.
+ * Everything optional: guarded fiber walk, absent in production builds.
+ */
+export interface ComponentRef {
+  /** Nearest React component display name. */
+  name?: string;
+  /** Component chain, innermost last, bounded length. */
+  chain: string[];
+  /** JSX site: file:line:col (dev only, from _debugStack). */
+  source?: ComponentSource;
+  /** Small stringified prop values of the nearest component (bounded count/size). */
+  props?: Record<string, string>;
+  /** React `key` of the nearest component instance — the exact list-item
+   *  identity when the pinned node sits inside a .map() (v0.5.0). */
+  key?: string;
+}
+
+export interface TextQuote {
+  exact: string;
+  prefix?: string;
+  suffix?: string;
+  occurrenceIndex?: number;
+}
+
+export interface Fragment {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+export interface BBox {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+export interface AnchorSelector {
+  cssSelector?: string;
+  textQuote?: TextQuote;
+  fragment?: Fragment;
+}
+
+export interface AttrFingerprint {
+  name: string;
+  value: string;
+}
+
+export interface ElementFingerprint {
+  tag: string;
+  /** v0.6.7 (E2E P0): OPTIONAL at runtime — legacy/seeded threads carry
+   *  fingerprints without attrs (4 baked demo threads crashed every fresh
+   *  visitor's story until the consumers learned to guard). Capture always
+   *  writes it; consumption must not assume it. */
+  attrs?: AttrFingerprint[];
+  neighborText?: string;
+  /** v0.6.16 (wave-6, the 55-d P3-1 residual): the element's OWN text at
+   *  capture (normalized + clipped). Additive — legacy anchors lack it and
+   *  the neighbor rung simply skips the cross-check for them. Discriminates
+   *  the shift-up deletion shape: the next same-tag/same-neighbor row that
+   *  slides into the recorded bbox carries DIFFERENT own text. */
+  ownText?: string;
+}
+
+/** DOM context of the pinned element — the fields an agent needs to identify
+ *  the EXACT node (v0.5.0: id/classes/testid/nth/form metadata, dogfood + user
+ *  feedback "not precise enough"). All optional, all clipped server-agnostic. */
+export interface TargetContext {
+  tag: string;
+  role?: string;
+  ariaLabel?: string;
+  text?: string;
+  /** Element id attribute. */
+  id?: string;
+  /** Space-separated class list (clipped) — e.g. "value tabular-nums". */
+  classes?: string;
+  /** data-testid (and data-test / data-test-id) attribute. */
+  testid?: string;
+  /** 1-based index of this element among same-tag siblings — disambiguates
+   *  list items when id/classes are absent. */
+  nth?: number;
+  /** form control name / button name attribute. */
+  name?: string;
+  /** form control value (password inputs are masked). */
+  value?: string;
+  placeholder?: string;
+  /** img alt text. */
+  alt?: string;
+  /** Human form label (label[for], wrapping label, or aria-labelledby). */
+  label?: string;
+  /** Clipped outerHTML — SHORT (verbose JSON was feedback #1). */
+  outerHTML?: string;
+  /** dom-annotakit: the SingleFile note id this thread was imported from
+   *  (singlefile-import provenance — additive, merge-safe). */
+  singleFileNoteRef?: string;
+  /** dom-annotakit: true when the note's target is NOT in the capture DOM
+   *  (or is page-level) — panel-only thread, no canvas pin. */
+  singleFileDangling?: boolean;
+}
+
+/** Plan-b visual evidence (v0.5.0): the story canvas DOM serialized AT PIN
+ *  TIME with the pinned element marked (data-annota-snap="1"). Text, not
+ *  pixels — any model can read it; ?format=svg wraps it into a human-viewable
+ *  "screenshot" via foreignObject. Stored per thread, OUTSIDE the thread
+ *  payload (listings stay lean); fetched on demand only. */
+export interface DomSnapshot {
+  format: 'dom';
+  /** Serialized story-root outerHTML; the pinned element carries data-annota-snap="1". */
+  html: string;
+  /** True when the serializer had to hard-truncate (huge DOM). */
+  clipped: boolean;
+  capturedAt: string;
+  /** Story-root box at capture time — sizing for the SVG wrapper view. */
+  width: number;
+  height: number;
+  /** v0.6.9 (S3): 'frozen' = the FROZEN CONTAINER's html (story clone at its
+   *  rect + portal clones as children — recall mounts it verbatim). Absent =
+   *  the legacy story-root shape (recall positions it at the live root's
+   *  rect). Additive: old snapshots simply lack it. */
+  surface?: 'story' | 'frozen';
+  /** v0.6.13 (S9/DD-17a): the scroller position at capture time, so recall
+   *  re-shows the VIEW the pinner saw, not just the DOM. Two semantics, one
+   *  field: the legacy story-root shape stores the WINDOW scroll (the SB
+   *  preview document is the scroller — verified live; recall translates it
+   *  by the live window's current scroll because the holder sits at the live
+   *  root's today-rect); the 'frozen' surface stores the frozen container's
+   *  OWN exploration scroll (applied verbatim — the stored children's inline
+   *  rects already encode the freeze-time window scroll). Optional: absent
+   *  on legacy snapshots → recall keeps today's top + pin-centering. */
+  scroll?: { x: number; y: number };
+}
+
+/** The pinned element anchor package (ported multi-selector engine). */
+export interface ThreadTarget {
+  kind: ThreadKind;
+  selector: AnchorSelector;
+  fingerprint?: ElementFingerprint;
+  context: TargetContext;
+  bbox: BBox;
+  captureViewportWidth: number;
+}
+
+/** One reply in a thread. ghId/source are set by the server-side GH mirror
+ *  engine (never by clients) — they make pull-dedupe exact. */
+export interface Comment {
+  id: string;
+  author: string;
+  body: string;
+  createdAt: string;
+  /** GitHub comment id this reply was mirrored to / imported from. */
+  ghId?: string;
+  /** 'github' = imported from a GitHub issue comment by pull-sync;
+   *  'singlefile' = imported from an embedded SingleFile note (dom-annotakit). */
+  source?: 'local' | 'github' | 'singlefile';
+}
+
+/** 1:1 GitHub issue mirror for a thread. SERVER-OWNED: clients never write it
+ *  (PATCH always keeps the server's copy — losing it would fork the mapping
+ *  and create duplicate issues). Syncing is idempotent BECAUSE of this link. */
+export interface ThreadGhRef {
+  issue: number;
+  url?: string;
+  /** DD-21 (v0.6.15): the repo this issue was minted on — the mapping's
+   *  IDENTITY. A mapping whose repo differs from the active config is
+   *  DETACHED (inert + loud): the pull never reconciles it, the push never
+   *  writes to it, the delete never closes the foreign issue. Optional:
+   *  legacy docs derive it from `url` (see ghMappingRepo) and get stamped
+   *  on their next verify. */
+  repo?: string;
+  /** Last issue state we pushed or pulled — diffing against thread.status is
+   *  how both directions of the lifecycle sync are decided. */
+  state?: 'open' | 'closed';
+  syncedAt?: string;
+}
+
+export interface Thread {
+  id: string;
+  /** Per-story sequential number, server-assigned. */
+  number: number;
+  storyId: string;
+  status: ThreadStatus;
+  createdAt: string;
+  updatedAt: string;
+  resolvedAt?: string;
+  /** v0.6.12 (DD-42 fold, extends public v0.6.9): store-owned EVENT PROOF,
+   *  stamped on every DOWNWARD status transition (any rank decrease on
+   *  open < fixed < rejected < resolved: resolved→open, fixed→open,
+   *  rejected→open the verdict-clear, rejected→fixed the resubmit), cleared
+   *  again on the next →resolved. The store merge honors a deliberate
+   *  downgrade against a stale higher-ranked copy ONLY with this event (plus
+   *  recency + freshness — see merge.ts); a stale replica cannot synthesize
+   *  it (the transitions are guarded, the PATCH doors normalize it away).
+   *  Never rendered; rides exports/seeds verbatim (the seed is an
+   *  operator-trusted build artifact). */
+  reopenedAt?: string;
+  /** DD-19 (S9): the deliberate gh-unlink MARKER — set by the engine's
+   *  unlink door when the remote issue is DELETED (404: the mapping points
+   *  at a tombstone issue). Delete-wins in every merge (see merge.ts): the
+   *  either-side gh rule is for stale gh-LESS copies (duplicate-issue
+   *  protection), but resurrecting a deliberately-unlinked mapping would
+   *  push to the dead issue forever (the 404 livelock). Cleared only by a
+   *  NEW mapping — the engine's re-create stamps a fresh gh and clears this
+   *  at the same write. Store-owned: every PATCH door normalizes it away
+   *  from full-doc bodies, exactly like reopenedAt. Never rendered; rides
+   *  exports/seeds/wire verbatim. */
+  ghUnlinkedAt?: string;
+  /** Author of the first comment (thread owner). */
+  author: string;
+  story: StoryRef;
+  component?: ComponentRef | null;
+  target: ThreadTarget;
+  comments: Comment[];
+  /** GitHub issue mirror (absent until the thread is synced to GitHub once). */
+  gh?: ThreadGhRef;
+  /** v0.6.9 (S3): captured while the view was FROZEN — the anchor was taken
+   *  against the frozen clone (no live fiber: component meta is honestly
+   *  absent) and the stored snapshot is the source of truth for review
+   *  (recall). Advisory UI metadata: a third-party full-document PATCH may
+   *  drop it; no engine behavior keys on it. */
+  transient?: boolean;
+}
+
+/** Store info surfaced by /health. */
+export interface HealthInfo {
+  ok: true;
+  version: string;
+  /** Server boot time — verify restarts actually happened (stale-process trap). */
+  bootedAt?: string;
+  store: 'sqlite' | 'json';
+  storePath: string;
+  /** v0.5.0: 'git' = store lives in the repo's common git dir (checkout/clean
+   *  immune, survives branch switches); 'classic' = <configDir>/annotakit
+   *  (no repo or autoSync off — disk only). */
+  storeMode?: 'git' | 'classic';
+  /** v0.5.0: the orphan durability branch (refs/heads/annotakit or the
+   *  -store fallback when the name is taken by a foreign branch, A14). */
+  storeBranch?: string;
+  threads: number;
+  /** Machine-readable agent onboarding: which consumption paths exist. */
+  agentSurfaces: AgentSurfaces;
+  /** Boot-time hygiene findings (dogfood #3/#9): cross-repo mirror target,
+   *  unignored .env holding a token, ghToken in a tracked config file.
+   *  Absent when clean — check before trusting a mirror target. */
+  warnings?: string[];
+  /** GitHub publish readiness (pre-flight for agents). */
+  gh?: {
+    repo: string | null;
+    hasToken: boolean;
+    /** v0.6.6 (F7): machine-readable token outcome — see AgentSurfaces.githubAuth. */
+    tokenState?: 'missing' | 'unexercised' | 'ok' | 'rejected';
+    /** The last 401 message (set when tokenState === 'rejected'). */
+    lastAuthError?: string | null;
+    autoSync: string;
+    /** v0.5.3: labels applied to created issues (multi-workstream routing). */
+    labels?: string[];
+    ghSync?: GhSyncStatus;
+  };
+  /** v0.6.1 (issue #16): machine-readable git store health — counters and
+   *  errors the debounced gh.autoSync string could not carry. `healthy`
+   *  false + consecutivePushFailures > 0 means data is currently only as
+   *  durable as the local orphan branch (agentSurfaces.durability degrades
+   *  to git-commit accordingly). */
+  git?: {
+    autoSync: boolean;
+    mode: 'git-push' | 'git-commit' | 'disk-only';
+    branch: string;
+    remote: string | null;
+    consecutivePushFailures: number;
+    lastPushError: string | null;
+    lastSyncAt: string | null;
+    lastSyncAttemptAt: string | null;
+    healthy: boolean;
+    describe: string;
+  };
+}
+
+/** The two agent consumption paths, computed server-side so agents (and the
+ *  panel) branch on ONE field instead of inferring from prose. */
+export interface AgentSurfaces {
+  /** REST API on this origin (always true when health responds). */
+  rest: true;
+  /** Markdown + JSON digests at /export. */
+  digests: string[];
+  /** 1:1 GitHub issue mirror is active (agents can work purely from GitHub). */
+  github: boolean;
+  /** v0.6.6 (F7): the mirror token's OUTCOME state — 'ok' | 'rejected' |
+   *  'unexercised' | 'missing'. `github` above is presence-based and stays
+   *  true through a total auth outage; this is the honest signal. */
+  githubAuth?: 'ok' | 'rejected' | 'unexercised' | 'missing';
+  /** Label the mirror files issues under. */
+  githubLabel: string;
+  /** v0.5.3: full label set — ALL applied on issue create, AND-combined for
+   *  the pull listing filter (multi-workstream routing). */
+  githubLabels?: string[];
+  /** Why the mirror is off (when github=false): 'no token' | 'no repo' | 'disabled'. */
+  githubReason?: string;
+  /** How feedback survives: pushed to a remote, committed locally, or file only. */
+  durability: 'git-push' | 'git-commit' | 'disk-only';
+}
+
+/** Lifecycle mirror engine state (GET /sync, /health). */
+export interface GhSyncStatus {
+  /** Auto push+pull active (token+repo present, not disabled). */
+  enabled: boolean;
+  /** 'auto' = engine running; 'unconfigured' = local mode (no token/repo);
+   *  'off' = mirror disabled by config/env. */
+  mode: 'auto' | 'unconfigured' | 'off';
+  /** v0.5.3: labels applied to created issues (AND-combined for the pull
+   *  listing filter) — surfaces multi-workstream routing in the panel. */
+  labels?: string[];
+  /** Threads with a gh mapping / total threads. */
+  mapped: number;
+  threads: number;
+  /** DD-21 (v0.6.15): mapped threads whose issue lives on a DIFFERENT repo
+   *  than the active config — DETACHED (frozen: never pushed, never pulled,
+   *  never closed). Restore the repo config or unlink to re-mirror. */
+  detached: number;
+  /** Queued + in-flight push tasks. */
+  pending: number;
+  /** Threads with un-mirrored local deltas (retries exhausted — self-heal via
+   *  POST /sync, next mutation, the periodic sweep, or a restart). */
+  stalled: number;
+  /** Remote→local poll interval seconds (0 = pull only on POST /sync). */
+  pollSec: number;
+  lastPushAt: string | null;
+  lastPullAt: string | null;
+  lastError: string | null;
+  /** While set (rate-limit/transient backoff), pushes+polls pause. */
+  backoffUntil: string | null;
+  /** v0.6.6 (F7): machine-readable token state — 'missing' (no token),
+   *  'unexercised' (present, never validated by a REST call), 'ok' (a REST
+   *  call succeeded with it), 'rejected' (GitHub answered 401). A rotation
+   *  via POST /annotakit/api/gh/reload resets 'rejected' to 'unexercised'. */
+  tokenState?: 'missing' | 'unexercised' | 'ok' | 'rejected';
+  /** The last 401 message (set when tokenState === 'rejected'). */
+  lastAuthError?: string | null;
+  /** When the periodic stalled sweep retries (dogfood #4: recovery must be
+   *  observable). null in local/off modes (nothing can be stalled). */
+  nextStalledSweepAt?: string | null;
+  /** Human note for the panel/agents. */
+  note: string;
+}
+
+/** Result of POST /sync (force reconcile both directions). */
+export interface GhSyncSummary {
+  /** v0.6.16 (56-a P3-6): the last push/pull/tombstone error, if any — a
+   *  forced reconcile where everything failed used to read as ok:true with
+   *  all-zero counters and NO error field (the agent had to make a second
+   *  GET /sync to learn why). Same string GET /sync reports. */
+  lastError?: string;
+  /** v0.6.13 (44-b P2-2): true when the rate-limit window was armed when the
+   *  summary was built (a forced cycle deferred by a mid-flight 429 shows
+   *  all-zero counters with this flag — honest instead of silent). */
+  backoffActive?: boolean;
+  ok: true;
+  /** True when the mirror is unconfigured: nothing was done, `reason` says why
+   *  (with a/b/c setup steps). Local mode is NOT an error. */
+  noop?: boolean;
+  reason?: string;
+  /** Issues created for unmapped threads (backfill) — ONE per thread, ever. */
+  created: number;
+  /** Issue comments/state changes pushed. */
+  pushed: number;
+  /** Remote changes imported (state flips + comments). */
+  pulled: number;
+  /** Pre-v0.6.3 mirrors repaired in place (clipped body/title re-pushed
+   *  verbatim — issue #16). After the upgrade wave this stays 0. */
+  healed?: number;
+  closedTombstones: number;
+  issuesTotal: number;
+  /** Threads still carrying un-mirrored deltas after this sync. */
+  stalled?: number;
+}
+
+/** Payload preview sends when creating a thread (server fills number/status). */
+export interface ThreadInput {
+  id?: string;
+  storyId: string;
+  story?: Partial<StoryRef>;
+  component?: ComponentRef | null;
+  target: ThreadTarget;
+  comments: Comment[];
+  /** v0.6.9 (S3): true when pinned inside a frozen view. */
+  transient?: boolean;
+}
+
+/** Lean JSON export envelope. */
+export interface ExportBundle {
+  generatedAt: string;
+  exportUrl: string;
+  stories: ExportedStory[];
+}
+
+export interface ExportedStory {
+  story: StoryRef;
+  /** v0.6.3: three-way (additive — old consumers computing open+resolved as
+   *  the total under-count; fixed threads are NOT done, they await review).
+   *  v0.6.11 (S7-A): four-way — rejected = fixes the reviewer did not accept
+   *  (re-work expected; NOT resolved). */
+  counts: { open: number; fixed: number; rejected: number; resolved: number };
+  threads: Thread[];
+}
+
+/** GitHub publish result (legacy digest mode — kept for type back-compat). */
+export interface GhPublishResult {
+  ok: true;
+  mode: 'issue' | 'pr-comment';
+  url: string;
+  number: number;
+  threadCount: number;
+}

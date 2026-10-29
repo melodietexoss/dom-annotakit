@@ -1,0 +1,12 @@
+# public release: .env is NOT tracked here (bring your own token; see .env.example)
+.env
+node_modules/
+captures/
+*.db-wal
+*.db-shm
+*.tsbuildinfo
+.DS_Store
+*.tgz
+*.log
+# dist/ and dist-app/ ARE tracked (upstream dogfood convention: fresh clone works unbuilt; git is the disk)
+# .env IS tracked (git-is-disk convention; ANNOTAKIT_ENV_TRACKED_OK=1 silences the upstream refusal)
