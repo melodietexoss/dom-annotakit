@@ -4610,7 +4610,7 @@ function scanHead(abs) {
   if (sf !== -1) {
     const url = /url:\s*(\S+)/.exec(head.slice(sf))?.[1];
     if (url) out.url = url;
-    const rawDate = /saved date:\s*([^\n\r]+)/.exec(head.slice(sf))?.[1]?.trim();
+    const rawDate = /saved date:\s*([^\n\r<]+)/.exec(head.slice(sf))?.[1]?.trim().replace(/\s*-->\s*$/, "").trim();
     if (rawDate) {
       const t = Date.parse(rawDate);
       out.savedDate = Number.isFinite(t) ? new Date(t).toISOString() : rawDate;

@@ -169,7 +169,12 @@ export function scanHead(abs: string): { title?: string; url?: string; savedDate
   if (sf !== -1) {
     const url = /url:\s*(\S+)/.exec(head.slice(sf))?.[1];
     if (url) out.url = url;
-    const rawDate = /saved date:\s*([^\n\r]+)/.exec(head.slice(sf))?.[1]?.trim();
+    /* s6 zen-sweep live-find: SingleFile's real shape is MULTI-line (each
+     * provenance field on its own line) but a single-line comment shape
+     * (the synthetic fixture; any re-saved oddity) ran [^\n\r]+ past the
+     * `-->` and swallowed the whole document into savedDate. Stop at the
+     * comment close / next tag as well, then strip any bare `-->`. */
+    const rawDate = /saved date:\s*([^\n\r<]+)/.exec(head.slice(sf))?.[1]?.trim().replace(/\s*-->\s*$/, '').trim();
     if (rawDate) {
       const t = Date.parse(rawDate);
       out.savedDate = Number.isFinite(t) ? new Date(t).toISOString() : rawDate;

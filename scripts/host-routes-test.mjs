@@ -176,6 +176,14 @@ await check('upload sanitize: size cap (100MB) enforced', async () => {
   assert.strictEqual(r.status, 413);
 });
 
+await check('scanHead: single-line provenance comment never leaks the document into savedDate (s6 zen-sweep live-find)', async () => {
+  const ONE_LINE = '<!DOCTYPE html><!-- Page saved with SingleFile  / url: https://one-line.example/x / saved date: 2026-10-22 --><html lang=en><head><title>one</title></head><body>hi</body>';
+  const r = await mgr.upload('one-line.html', ONE_LINE, false, fakeGit);
+  assert.ok(r.ok, r.error);
+  assert.strictEqual(r.entry.savedDate, '2026-10-22T00:00:00.000Z', `savedDate must be a clean ISO date, got ${JSON.stringify(r.entry.savedDate)}`);
+  assert.ok(!r.entry.savedDate.includes('-->') && !r.entry.savedDate.includes('<'), 'no comment-close/tag leakage');
+});
+
 await check('upload: git durability is best-effort (a failed push stays a WARNING)', async () => {
   const failingGit = { toplevel: '/fake/repo', run: () => ({ ok: false, out: 'push rejected' }), runAsync: async () => ({ ok: false, out: 'push rejected' }) };
   const r = await mgr.upload('durability.html', HTML, false, failingGit);
